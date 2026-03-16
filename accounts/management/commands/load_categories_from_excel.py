@@ -7,6 +7,12 @@ the **first step** in the initial load: categories are created from the
 Excel reference so that new accounts coming from SAP can be immediately
 classified.
 
+This command is responsible **only** for loading the category hierarchy
+(cat / subcat) from the Excel file.  It also persists each account-code
+to (cat, subcat) mapping as a level-2 ``AccountClassification`` record
+so that the PUC loading command can classify accounts by their initials
+(prefix matching) without relying on a hard-coded schema file.
+
 Usage::
 
     python manage.py load_categories_from_excel 1000 Esquema_Cuentas_PUC_1000.xlsx
@@ -116,18 +122,19 @@ class Command(BaseCommand):
             sociedad, tree,
         )
 
+        # Step 4 – Persist account-code → (cat, subcat) mappings as level-2
+        # records so that the PUC loading command can classify accounts by
+        # their initials (prefix) without relying on a hard-coded schema file.
+        puc_schema = build_puc_schema(result.rows)
+        codes_created = self._create_code_mappings(sociedad, puc_schema)
+
         self.stdout.write(
             self.style.SUCCESS(
                 f"Sincronización completada para sociedad {sociedad}: "
                 f"{cats_created} categorías creadas, "
-                f"{subcats_created} subcategorías creadas."
+                f"{subcats_created} subcategorías creadas, "
+                f"{codes_created} mapeos de código creados."
             )
-        )
-
-        # Step 4 – Store the PUC schema for future account assignment
-        puc_schema = build_puc_schema(result.rows)
-        self.stdout.write(
-            f"Esquema PUC construido: {len(puc_schema)} cuentas mapeadas."
         )
 
     # ------------------------------------------------------------------
@@ -185,6 +192,59 @@ class Command(BaseCommand):
                     )
 
         return cats_created, subcats_created
+
+    # ------------------------------------------------------------------
+    # Persist account-code mappings (level 2)
+    # ------------------------------------------------------------------
+    def _create_code_mappings(
+        self,
+        sociedad: str,
+        puc_schema: dict[str, tuple[str, str]],
+    ) -> int:
+        """Create level-2 AccountClassification records that map each
+        account code from the Excel to its (cat, subcat) pair.
+
+        These records are later consumed by the PUC loading command
+        (``taskcreacioncuentascategoria``) to classify accounts by their
+        initials (prefix matching) without relying on a hard-coded schema.
+
+        Returns the number of new mapping records created.
+        """
+        codes_created = 0
+        for account_code, (nombre_cat, nombre_subcat) in puc_schema.items():
+            # Look up the parent subcategory (level=1) for this mapping
+            cat_code = nombre_cat[:MAX_CODE_LENGTH]
+            sub_code = f"{cat_code}:{nombre_subcat}"[:MAX_CODE_LENGTH]
+            try:
+                parent_subcat = AccountClassification.objects.get(
+                    code=sub_code,
+                    sociedad=sociedad,
+                    level=1,
+                )
+            except AccountClassification.DoesNotExist:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Subcategoría '{nombre_subcat}' no encontrada para "
+                        f"código {account_code} – omitido."
+                    )
+                )
+                continue
+
+            _mapping, created = AccountClassification.objects.get_or_create(
+                code=account_code[:MAX_CODE_LENGTH],
+                sociedad=sociedad,
+                defaults={
+                    "name": account_code,
+                    "parent": parent_subcat,
+                    "level": 2,
+                    "cat": nombre_cat,
+                    "subcat": nombre_subcat,
+                },
+            )
+            if created:
+                codes_created += 1
+
+        return codes_created
 
     # ------------------------------------------------------------------
     # Helpers

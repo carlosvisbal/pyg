@@ -521,8 +521,29 @@ class TaskCreacionCuentasCategoriaTests(TestCase):
             "5105030100": ("GASTOS OPERACIONALES", "Administracion"),
         }
 
-        # Step 1 – sync classifications
+        # Step 1 – sync classifications (creates level-0 and level-1 records)
         cmd._sync_classifications("1100", puc_schema)
+
+        # Step 1b – create level-2 code-mapping records so that
+        # _read_puc_schema_from_db returns the right schema
+        max_len = AccountClassification._meta.get_field("code").max_length
+        for code, (cat, subcat) in puc_schema.items():
+            cat_code = cat[:max_len]
+            sub_code = f"{cat_code}:{subcat}"[:max_len]
+            parent_sub = AccountClassification.objects.get(
+                code=sub_code, sociedad="1100", level=1,
+            )
+            AccountClassification.objects.get_or_create(
+                code=code,
+                sociedad="1100",
+                defaults={
+                    "name": code,
+                    "parent": parent_sub,
+                    "level": 2,
+                    "cat": cat,
+                    "subcat": subcat,
+                },
+            )
 
         # Step 2 – mock SAP to return one known account
         fake_cuentas = [
@@ -539,6 +560,88 @@ class TaskCreacionCuentasCategoriaTests(TestCase):
         acct = Account.objects.get(code="4120950100", sociedad="1100")
         self.assertEqual(acct.classification.cat, "INGRESOS")
         self.assertEqual(acct.classification.subcat, "Nacionales")
+
+    def test_asignar_prefix_matching(self):
+        """asignar_categoria_subcategoria falls back to prefix (iniciales) lookup."""
+        from accounts.management.commands.taskcreacioncuentascategoria import Command
+
+        # Schema stores a 10-digit code; incoming account has a longer code
+        # sharing the same prefix – prefix matching should resolve it.
+        schema = {"412095": ("INGRESOS", "Nacionales")}
+        cat, subcat = Command.asignar_categoria_subcategoria(
+            "4120950100", schema,
+        )
+        self.assertEqual(cat, "INGRESOS")
+        self.assertEqual(subcat, "Nacionales")
+
+    def test_asignar_prefix_no_match_returns_none(self):
+        """asignar_categoria_subcategoria returns (None, None) when no prefix matches."""
+        from accounts.management.commands.taskcreacioncuentascategoria import Command
+
+        schema = {"412095": ("INGRESOS", "Nacionales")}
+        cat, subcat = Command.asignar_categoria_subcategoria(
+            "9999999999", schema,
+        )
+        self.assertIsNone(cat)
+        self.assertIsNone(subcat)
+
+    def test_read_puc_schema_from_db_empty(self):
+        """_read_puc_schema_from_db returns empty dict when no level-2 records exist."""
+        from io import StringIO
+        from django.core.management.color import no_style
+        from accounts.management.commands.taskcreacioncuentascategoria import Command
+
+        cmd = Command()
+        cmd.stdout = StringIO()
+        cmd.style = no_style()
+
+        schema = cmd._read_puc_schema_from_db("1100")
+        self.assertEqual(schema, {})
+
+    def test_read_puc_schema_from_db_returns_mappings(self):
+        """_read_puc_schema_from_db returns code→(cat,subcat) from level-2 records."""
+        from io import StringIO
+        from django.core.management.color import no_style
+        from accounts.management.commands.taskcreacioncuentascategoria import Command
+
+        # Create the minimal hierarchy needed for level-2 records
+        cat = AccountClassification.objects.create(
+            code="INGRESOS", name="INGRESOS", sociedad="1100", level=0,
+            cat="INGRESOS",
+        )
+        sub = AccountClassification.objects.create(
+            code="INGRESOS:Nacionales", name="Nacionales", sociedad="1100",
+            level=1, parent=cat, cat="INGRESOS", subcat="Nacionales",
+        )
+        AccountClassification.objects.create(
+            code="4120950100", name="4120950100", sociedad="1100",
+            level=2, parent=sub, cat="INGRESOS", subcat="Nacionales",
+        )
+
+        cmd = Command()
+        cmd.stdout = StringIO()
+        cmd.style = no_style()
+
+        schema = cmd._read_puc_schema_from_db("1100")
+        self.assertIn("4120950100", schema)
+        self.assertEqual(schema["4120950100"], ("INGRESOS", "Nacionales"))
+
+    def test_handle_warns_when_no_db_mappings(self):
+        """handle() emits a warning when no level-2 records are found."""
+        from io import StringIO
+        from unittest.mock import patch
+        from django.core.management.color import no_style
+        from accounts.management.commands.taskcreacioncuentascategoria import Command
+
+        cmd = Command()
+        cmd.stdout = StringIO()
+        cmd.style = no_style()
+
+        with patch.object(cmd, "_lista_cuentas_sap", return_value=[]):
+            cmd.handle(sociedad="1100")
+
+        output = cmd.stdout.getvalue()
+        self.assertIn("load_categories_from_excel", output)
 
 
 # --------------------------------------------------------------------------
@@ -861,6 +964,110 @@ class LoadCategoriesFromExcelTests(TestCase):
             ).count(),
             1,
         )
+
+    def test_creates_code_mappings(self):
+        """load_categories_from_excel creates level-2 account-code mappings."""
+        from io import StringIO
+        from django.core.management import call_command
+
+        path = self._make_excel([
+            (
+                "Nombre Categoría",
+                "Nombre Subcategoría",
+                "Nombre Cuenta",
+                "Descripción Cuenta",
+            ),
+            ("INGRESOS", "Nacionales", "4120950100", "Ventas nacionales"),
+            ("INGRESOS", "Exterior", "4120950200", "Exportaciones"),
+            ("GASTOS OP", "Admin", "5105030100", "Gastos admin"),
+        ])
+
+        out = StringIO()
+        try:
+            call_command(
+                "load_categories_from_excel", "1100", path, stdout=out,
+            )
+        finally:
+            os.unlink(path)
+
+        # Level-2 mapping records should exist
+        mapping = AccountClassification.objects.filter(
+            code="4120950100", sociedad="1100", level=2,
+        )
+        self.assertTrue(mapping.exists())
+        self.assertEqual(mapping.first().cat, "INGRESOS")
+        self.assertEqual(mapping.first().subcat, "Nacionales")
+
+        # All three account codes should be stored
+        self.assertEqual(
+            AccountClassification.objects.filter(
+                sociedad="1100", level=2,
+            ).count(),
+            3,
+        )
+
+    def test_validate_only_does_not_create_mappings(self):
+        """--validate-only does not create level-2 mapping records."""
+        from io import StringIO
+        from django.core.management import call_command
+
+        path = self._make_excel([
+            (
+                "Nombre Categoría",
+                "Nombre Subcategoría",
+                "Nombre Cuenta",
+                "Descripción Cuenta",
+            ),
+            ("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+        ])
+
+        out = StringIO()
+        try:
+            call_command(
+                "load_categories_from_excel",
+                "1100",
+                path,
+                "--validate-only",
+                stdout=out,
+            )
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(
+            AccountClassification.objects.filter(level=2).count(), 0,
+        )
+
+    def test_code_mappings_link_to_correct_parent(self):
+        """Level-2 mapping records are children of the right level-1 subcategory."""
+        from io import StringIO
+        from django.core.management import call_command
+
+        path = self._make_excel([
+            (
+                "Nombre Categoría",
+                "Nombre Subcategoría",
+                "Nombre Cuenta",
+                "Descripción Cuenta",
+            ),
+            ("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+            ("INGRESOS", "Exterior", "4120950200", "Export"),
+        ])
+
+        out = StringIO()
+        try:
+            call_command(
+                "load_categories_from_excel", "1100", path, stdout=out,
+            )
+        finally:
+            os.unlink(path)
+
+        mapping = AccountClassification.objects.get(
+            code="4120950100", sociedad="1100", level=2,
+        )
+        self.assertIsNotNone(mapping.parent)
+        self.assertEqual(mapping.parent.level, 1)
+        self.assertEqual(mapping.parent.subcat, "Nacionales")
+        self.assertEqual(mapping.parent.cat, "INGRESOS")
 
     def test_real_excel_1100_valid(self):
         """Smoke test: the real Excel file for sociedad 1100 is valid."""
