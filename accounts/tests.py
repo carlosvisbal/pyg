@@ -464,3 +464,76 @@ class TaskCreacionCuentasCategoriaTests(TestCase):
                 name="GASTOS OPERACIONALES", sociedad="1100",
             ).exists()
         )
+
+    def test_sync_classifications_stores_cat_subcat(self):
+        """Category (level 0) stores cat; subcategory (level 1) stores cat and subcat."""
+        from io import StringIO
+        from django.core.management.color import no_style
+        from accounts.management.commands.taskcreacioncuentascategoria import Command
+
+        cmd = Command()
+        cmd.stdout = StringIO()
+        cmd.style = no_style()
+
+        small_schema = {
+            "4120950100": ("INGRESOS", "Nacionales"),
+            "4120950200": ("INGRESOS", "Exterior"),
+        }
+        cmd._sync_classifications("1100", small_schema)
+
+        # Level-0 category should have cat set
+        cat_obj = AccountClassification.objects.get(
+            level=0, sociedad="1100", name="INGRESOS",
+        )
+        self.assertEqual(cat_obj.cat, "INGRESOS")
+        self.assertEqual(cat_obj.subcat, "")
+
+        # Level-1 subcategory should have both cat and subcat set
+        sub_nac = AccountClassification.objects.get(
+            level=1, sociedad="1100", name="Nacionales",
+            parent=cat_obj,
+        )
+        self.assertEqual(sub_nac.cat, "INGRESOS")
+        self.assertEqual(sub_nac.subcat, "Nacionales")
+
+        sub_ext = AccountClassification.objects.get(
+            level=1, sociedad="1100", name="Exterior",
+            parent=cat_obj,
+        )
+        self.assertEqual(sub_ext.cat, "INGRESOS")
+        self.assertEqual(sub_ext.subcat, "Exterior")
+
+    def test_account_lookup_uses_cat_subcat(self):
+        """New accounts are matched to classifications via cat/subcat fields."""
+        from io import StringIO
+        from unittest.mock import patch
+        from django.core.management.color import no_style
+        from accounts.management.commands.taskcreacioncuentascategoria import Command
+
+        cmd = Command()
+        cmd.stdout = StringIO()
+        cmd.style = no_style()
+
+        puc_schema = {
+            "4120950100": ("INGRESOS", "Nacionales"),
+            "5105030100": ("GASTOS OPERACIONALES", "Administracion"),
+        }
+
+        # Step 1 – sync classifications
+        cmd._sync_classifications("1100", puc_schema)
+
+        # Step 2 – mock SAP to return one known account
+        fake_cuentas = [
+            {
+                "PLAN DE CUENTA": "YINC",
+                "CTA. MAYOR": "4120950100",
+                "DESCRIPCIÓN": "Ventas nacionales",
+            },
+        ]
+        with patch.object(cmd, "_lista_cuentas_sap", return_value=fake_cuentas):
+            cmd.handle(sociedad="1100")
+
+        # The account should be linked to the correct subcategory
+        acct = Account.objects.get(code="4120950100", sociedad="1100")
+        self.assertEqual(acct.classification.cat, "INGRESOS")
+        self.assertEqual(acct.classification.subcat, "Nacionales")

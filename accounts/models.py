@@ -30,6 +30,18 @@ class AccountClassification(models.Model):
         default=0,
         help_text="Depth in the classification hierarchy (0 = root).",
     )
+    cat = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="PUC category identifier from the company schema.",
+    )
+    subcat = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="PUC subcategory identifier from the company schema.",
+    )
     sign = models.SmallIntegerField(
         default=1,
         help_text="1 for credit-normal (revenue), -1 for debit-normal (expense).",
