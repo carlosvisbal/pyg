@@ -6,8 +6,19 @@ from django.utils import timezone
 class AccountClassification(models.Model):
     """Hierarchical classification for P&L accounts (e.g. Revenue > Sales)."""
 
+    SOCIEDAD_CHOICES = [
+        ("1000", "Sociedad 1000"),
+        ("1100", "Sociedad 1100"),
+    ]
+
     name = models.CharField(max_length=255)
-    code = models.CharField(max_length=50, unique=True)
+    code = models.CharField(max_length=50)
+    sociedad = models.CharField(
+        max_length=4,
+        choices=SOCIEDAD_CHOICES,
+        default="1100",
+        help_text="Company code (sociedad) this classification belongs to.",
+    )
     parent = models.ForeignKey(
         "self",
         on_delete=models.CASCADE,
@@ -29,6 +40,7 @@ class AccountClassification(models.Model):
 
     class Meta:
         ordering = ["code"]
+        unique_together = [("code", "sociedad")]
         verbose_name = "Account Classification"
         verbose_name_plural = "Account Classifications"
 
@@ -39,12 +51,23 @@ class AccountClassification(models.Model):
 class Account(models.Model):
     """Individual P&L account linked to a classification."""
 
-    code = models.CharField(max_length=50, unique=True)
+    SOCIEDAD_CHOICES = [
+        ("1000", "Sociedad 1000"),
+        ("1100", "Sociedad 1100"),
+    ]
+
+    code = models.CharField(max_length=50)
     name = models.CharField(max_length=255)
     classification = models.ForeignKey(
         AccountClassification,
         on_delete=models.PROTECT,
         related_name="accounts",
+    )
+    sociedad = models.CharField(
+        max_length=4,
+        choices=SOCIEDAD_CHOICES,
+        default="1100",
+        help_text="Company code (sociedad) this account belongs to.",
     )
     description = models.TextField(blank=True, default="")
     is_active = models.BooleanField(default=True)
@@ -53,6 +76,7 @@ class Account(models.Model):
 
     class Meta:
         ordering = ["code"]
+        unique_together = [("code", "sociedad")]
         verbose_name = "Account"
         verbose_name_plural = "Accounts"
 
