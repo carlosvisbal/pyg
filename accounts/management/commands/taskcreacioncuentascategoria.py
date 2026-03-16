@@ -3,20 +3,27 @@ Management command: taskcreacioncuentascategoria
 
 Synchronises the SAP account master for a given *sociedad*.
 
-**Phase 1** – Create category and subcategory ``AccountClassification``
-records from the PUC schema (``puc_schemas.py``).  Categories must exist
-*before* accounts so that new accounts arriving from SAP can be
-classified immediately.
+**Phase 1** – Read category and subcategory ``AccountClassification``
+records from the database.  These records must have been previously
+created by ``load_categories_from_excel``.  A warning is emitted when
+no categories are found so the operator knows to run that command first.
 
 **Phase 2** – Fetch the list of accounts from the SAP ledger via ODBC
 and create any missing ``Account`` records, assigning each one to its
-corresponding subcategory via the ``cat`` / ``subcat`` lookup.
+corresponding subcategory.
+
+Account classification uses **iniciales (prefix) matching**: the command
+reads the level-2 ``AccountClassification`` code-mapping records (written
+by ``load_categories_from_excel``) and tries progressively shorter
+prefixes of each incoming account code until a match is found.  This
+means accounts whose codes were not listed verbatim in the Excel are
+still classified correctly as long as they share a common prefix with a
+stored code.
 """
 
 from django.core.management.base import BaseCommand
 
 from accounts.models import Account, AccountClassification
-from accounts.puc_schemas import get_puc_schema
 
 MAX_CODE_LENGTH = AccountClassification._meta.get_field("code").max_length
 
@@ -24,8 +31,9 @@ MAX_CODE_LENGTH = AccountClassification._meta.get_field("code").max_length
 class Command(BaseCommand):
     help = (
         "Sincroniza el maestro de cuentas del libro SAP para una sociedad "
-        "(1000 o 1100).  Fase 1: crea categorías y subcategorías desde el "
-        "esquema PUC.  Fase 2: carga cuentas desde SAP y las clasifica."
+        "(1000 o 1100).  Fase 1: lee las categorías y subcategorías desde la "
+        "base de datos (deben haber sido cargadas con load_categories_from_excel).  "
+        "Fase 2: carga cuentas desde SAP y las clasifica por iniciales."
     )
 
     def add_arguments(self, parser):
@@ -42,14 +50,27 @@ class Command(BaseCommand):
     # ------------------------------------------------------------------
     def handle(self, *args, **kwargs):
         sociedad = kwargs["sociedad"]
-        puc_schema = get_puc_schema(sociedad)
 
-        # ── Phase 1: Create category & subcategory classifications ────
+        # ── Phase 1: Read category & subcategory classifications from DB ──
         self.stdout.write(
-            f"Fase 1 – Creando categorías y subcategorías para "
-            f"sociedad {sociedad}…"
+            f"Fase 1 – Leyendo categorías y subcategorías desde la base de "
+            f"datos para sociedad {sociedad}…"
         )
-        self._sync_classifications(sociedad, puc_schema)
+        puc_schema = self._read_puc_schema_from_db(sociedad)
+
+        if not puc_schema:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"No se encontraron mapeos de código para sociedad "
+                    f"{sociedad} en la base de datos.  "
+                    f"Ejecute primero: "
+                    f"python manage.py load_categories_from_excel {sociedad} <archivo.xlsx>"
+                )
+            )
+        else:
+            self.stdout.write(
+                f"  {len(puc_schema)} mapeos de código cargados desde la DB."
+            )
 
         # ── Phase 2: Fetch accounts from SAP and classify them ────────
         self.stdout.write(
@@ -69,7 +90,27 @@ class Command(BaseCommand):
         )
 
     # ------------------------------------------------------------------
-    # Phase 1 – Classification sync
+    # Phase 1 – Read PUC schema from DB (built by load_categories_from_excel)
+    # ------------------------------------------------------------------
+    def _read_puc_schema_from_db(
+        self,
+        sociedad: str,
+    ) -> dict[str, tuple[str, str]]:
+        """Build a ``{account_code: (cat, subcat)}`` dict from the level-2
+        ``AccountClassification`` records that were persisted by the
+        ``load_categories_from_excel`` command.
+
+        Returns an empty dict if no mappings exist yet.
+        """
+        mappings = AccountClassification.objects.filter(
+            level=2,
+            sociedad=sociedad,
+        ).values("code", "cat", "subcat")
+        return {m["code"]: (m["cat"], m["subcat"]) for m in mappings}
+
+    # ------------------------------------------------------------------
+    # Phase 1 – Classification sync (kept for backward-compatibility /
+    # standalone use when categories need to be created from a schema dict)
     # ------------------------------------------------------------------
     def _sync_classifications(self, sociedad, puc_schema):
         """Create category (level 0) and subcategory (level 1) records.
@@ -125,7 +166,8 @@ class Command(BaseCommand):
         """Create ``Account`` records from the SAP account list.
 
         Each account is matched to its subcategory classification using
-        the ``cat`` / ``subcat`` fields, so the category tree **must**
+        the ``cat`` / ``subcat`` fields on the level-1
+        ``AccountClassification`` records.  The category tree **must**
         already exist in the database before calling this method.
 
         Returns ``(created_count, unassigned_count)``.
@@ -151,11 +193,12 @@ class Command(BaseCommand):
                 sin_asignar += 1
                 continue
 
-            # Retrieve the subcategory classification
+            # Retrieve the subcategory classification (level=1 only)
             subcategoria = AccountClassification.objects.filter(
                 cat=nombre_cat,
                 subcat=nombre_subcat,
                 sociedad=sociedad,
+                level=1,
             ).first()
 
             if subcategoria is None:
@@ -189,22 +232,41 @@ class Command(BaseCommand):
         return nuevas, sin_asignar
 
     # ------------------------------------------------------------------
-    # Category / subcategory lookup (data-driven)
+    # Category / subcategory lookup – iniciales (prefix) matching
     # ------------------------------------------------------------------
     @staticmethod
     def asignar_categoria_subcategoria(
         codigo: str,
         puc_schema: dict[str, tuple[str, str]],
     ) -> tuple[str | None, str | None]:
-        """Look up an account code in the PUC schema and return
-        ``(category_name, subcategory_name)``.
+        """Look up an account code in the PUC schema using iniciales
+        (prefix) matching and return ``(category_name, subcategory_name)``.
 
-        Returns ``(None, None)`` when the code is not found.
+        The lookup strategy is:
+
+        1. Try an exact match for ``codigo``.
+        2. If not found, try progressively shorter prefixes of ``codigo``
+           (from ``len(codigo) - 1`` down to 1) until a stored code is
+           found whose value is used as the classification.
+
+        This allows accounts whose full codes are not listed in the Excel
+        to still be classified when they share an initial prefix with a
+        stored code.
+
+        Returns ``(None, None)`` when no match is found at any prefix
+        length.
         """
         codigo = codigo.strip()
+        # Exact match
         result = puc_schema.get(codigo)
         if result is not None:
             return result
+        # Prefix (iniciales) matching – try shorter prefixes
+        for length in range(len(codigo) - 1, 0, -1):
+            prefix = codigo[:length]
+            result = puc_schema.get(prefix)
+            if result is not None:
+                return result
         return (None, None)
 
     # ------------------------------------------------------------------
