@@ -1,16 +1,31 @@
+"""
+Management command: taskcreacioncuentascategoria
+
+Synchronises the SAP account master for a given *sociedad*.
+
+**Phase 1** – Create category and subcategory ``AccountClassification``
+records from the PUC schema (``puc_schemas.py``).  Categories must exist
+*before* accounts so that new accounts arriving from SAP can be
+classified immediately.
+
+**Phase 2** – Fetch the list of accounts from the SAP ledger via ODBC
+and create any missing ``Account`` records, assigning each one to its
+corresponding subcategory via the ``cat`` / ``subcat`` lookup.
+"""
+
 from django.core.management.base import BaseCommand
 
 from accounts.models import Account, AccountClassification
+from accounts.puc_schemas import get_puc_schema
 
 MAX_CODE_LENGTH = AccountClassification._meta.get_field("code").max_length
-from accounts.puc_schemas import get_puc_schema
 
 
 class Command(BaseCommand):
     help = (
         "Sincroniza el maestro de cuentas del libro SAP para una sociedad "
-        "(1000 o 1100). Crea las categorías, subcategorías y cuentas "
-        "contables a partir del esquema PUC definido en puc_schemas.py."
+        "(1000 o 1100).  Fase 1: crea categorías y subcategorías desde el "
+        "esquema PUC.  Fase 2: carga cuentas desde SAP y las clasifica."
     )
 
     def add_arguments(self, parser):
@@ -29,63 +44,22 @@ class Command(BaseCommand):
         sociedad = kwargs["sociedad"]
         puc_schema = get_puc_schema(sociedad)
 
-        # Step 1 – Ensure category & subcategory classifications exist
+        # ── Phase 1: Create category & subcategory classifications ────
+        self.stdout.write(
+            f"Fase 1 – Creando categorías y subcategorías para "
+            f"sociedad {sociedad}…"
+        )
         self._sync_classifications(sociedad, puc_schema)
 
-        # Step 2 – Fetch accounts from SAP and create any missing ones
+        # ── Phase 2: Fetch accounts from SAP and classify them ────────
+        self.stdout.write(
+            f"Fase 2 – Cargando cuentas desde SAP para "
+            f"sociedad {sociedad}…"
+        )
         cuentas = self._lista_cuentas_sap(sociedad)
-        nuevas = 0
-        sin_asignar = 0
-
-        for cuenta in cuentas:
-            codigo = str(cuenta["CTA. MAYOR"]).strip()
-            descripcion = cuenta["DESCRIPCIÓN"]
-
-            nombre_cat, nombre_subcat = self.asignar_categoria_subcategoria(
-                codigo, puc_schema,
-            )
-
-            if nombre_cat is None:
-                self.stdout.write(
-                    self.style.WARNING(
-                        f"Sin esquema para la cuenta {codigo} en sociedad {sociedad}"
-                    )
-                )
-                sin_asignar += 1
-                continue
-
-            # Retrieve the subcategory classification
-            subcategoria = AccountClassification.objects.filter(
-                cat=nombre_cat,
-                subcat=nombre_subcat,
-                sociedad=sociedad,
-            ).first()
-
-            if subcategoria is None:
-                self.stdout.write(
-                    self.style.WARNING(
-                        f"Subcategoría '{nombre_subcat}' no encontrada para "
-                        f"categoría '{nombre_cat}' en sociedad {sociedad}"
-                    )
-                )
-                sin_asignar += 1
-                continue
-
-            _account, created = Account.objects.get_or_create(
-                code=codigo,
-                sociedad=sociedad,
-                defaults={
-                    "name": descripcion,
-                    "classification": subcategoria,
-                    "description": descripcion,
-                },
-            )
-
-            if created:
-                nuevas += 1
-                self.stdout.write(
-                    self.style.SUCCESS(f"Cuenta creada: {codigo} - {descripcion}")
-                )
+        nuevas, sin_asignar = self._create_accounts(
+            sociedad, cuentas, puc_schema,
+        )
 
         self.stdout.write(
             self.style.SUCCESS(
@@ -95,11 +69,14 @@ class Command(BaseCommand):
         )
 
     # ------------------------------------------------------------------
-    # Classification sync
+    # Phase 1 – Classification sync
     # ------------------------------------------------------------------
     def _sync_classifications(self, sociedad, puc_schema):
-        """Create category (level 0) and subcategory (level 1) records."""
-        # Build {category: {subcategory, …}} from the schema
+        """Create category (level 0) and subcategory (level 1) records.
+
+        Builds a ``{category: {subcategory, …}}`` tree from the schema
+        and ensures every node exists in the database.
+        """
         tree: dict[str, set[str]] = {}
         for _code, (cat, subcat) in puc_schema.items():
             tree.setdefault(cat, set()).add(subcat)
@@ -142,6 +119,76 @@ class Command(BaseCommand):
                     )
 
     # ------------------------------------------------------------------
+    # Phase 2 – Account creation from SAP data
+    # ------------------------------------------------------------------
+    def _create_accounts(self, sociedad, cuentas, puc_schema):
+        """Create ``Account`` records from the SAP account list.
+
+        Each account is matched to its subcategory classification using
+        the ``cat`` / ``subcat`` fields, so the category tree **must**
+        already exist in the database before calling this method.
+
+        Returns ``(created_count, unassigned_count)``.
+        """
+        nuevas = 0
+        sin_asignar = 0
+
+        for cuenta in cuentas:
+            codigo = str(cuenta["CTA. MAYOR"]).strip()
+            descripcion = cuenta["DESCRIPCIÓN"]
+
+            nombre_cat, nombre_subcat = self.asignar_categoria_subcategoria(
+                codigo, puc_schema,
+            )
+
+            if nombre_cat is None:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Sin esquema para la cuenta {codigo} "
+                        f"en sociedad {sociedad}"
+                    )
+                )
+                sin_asignar += 1
+                continue
+
+            # Retrieve the subcategory classification
+            subcategoria = AccountClassification.objects.filter(
+                cat=nombre_cat,
+                subcat=nombre_subcat,
+                sociedad=sociedad,
+            ).first()
+
+            if subcategoria is None:
+                self.stdout.write(
+                    self.style.WARNING(
+                        f"Subcategoría '{nombre_subcat}' no encontrada para "
+                        f"categoría '{nombre_cat}' en sociedad {sociedad}"
+                    )
+                )
+                sin_asignar += 1
+                continue
+
+            _account, created = Account.objects.get_or_create(
+                code=codigo,
+                sociedad=sociedad,
+                defaults={
+                    "name": descripcion,
+                    "classification": subcategoria,
+                    "description": descripcion,
+                },
+            )
+
+            if created:
+                nuevas += 1
+                self.stdout.write(
+                    self.style.SUCCESS(
+                        f"Cuenta creada: {codigo} - {descripcion}"
+                    )
+                )
+
+        return nuevas, sin_asignar
+
+    # ------------------------------------------------------------------
     # Category / subcategory lookup (data-driven)
     # ------------------------------------------------------------------
     @staticmethod
@@ -149,11 +196,10 @@ class Command(BaseCommand):
         codigo: str,
         puc_schema: dict[str, tuple[str, str]],
     ) -> tuple[str | None, str | None]:
-        """
-        Look up an account code in the PUC schema and return
-        (category_name, subcategory_name).
+        """Look up an account code in the PUC schema and return
+        ``(category_name, subcategory_name)``.
 
-        Returns (None, None) when the code is not found.
+        Returns ``(None, None)`` when the code is not found.
         """
         codigo = codigo.strip()
         result = puc_schema.get(codigo)
@@ -174,7 +220,8 @@ class Command(BaseCommand):
         except ImportError:
             self.stdout.write(
                 self.style.ERROR(
-                    "pyodbc no está instalado. No se pueden obtener cuentas de SAP."
+                    "pyodbc no está instalado. "
+                    "No se pueden obtener cuentas de SAP."
                 )
             )
             return []

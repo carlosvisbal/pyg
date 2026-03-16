@@ -1,3 +1,5 @@
+import os
+import tempfile
 from decimal import Decimal
 
 from django.contrib.auth import get_user_model
@@ -537,3 +539,356 @@ class TaskCreacionCuentasCategoriaTests(TestCase):
         acct = Account.objects.get(code="4120950100", sociedad="1100")
         self.assertEqual(acct.classification.cat, "INGRESOS")
         self.assertEqual(acct.classification.subcat, "Nacionales")
+
+
+# --------------------------------------------------------------------------
+# Excel utility tests
+# --------------------------------------------------------------------------
+
+def _make_test_xlsx(rows, path):
+    """Helper: create a minimal .xlsx file with given rows (list of tuples)."""
+    import openpyxl
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    for row in rows:
+        ws.append(row)
+    wb.save(path)
+    wb.close()
+
+
+class ExcelUtilsTests(TestCase):
+    """Tests for the accounts.excel_utils module."""
+
+    def test_read_valid_excel(self):
+        from accounts.excel_utils import read_and_validate_excel
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            _make_test_xlsx(
+                [
+                    (
+                        "Nombre Categoría",
+                        "Nombre Subcategoría",
+                        "Nombre Cuenta",
+                        "Descripción Cuenta",
+                    ),
+                    ("INGRESOS", "Nacionales", "4120950100", "Ventas nacionales"),
+                    ("INGRESOS", "Exterior", "4120950200", "Exportaciones"),
+                    ("GASTOS", "Admin", "5105030100", "Gastos admin"),
+                ],
+                tmp.name,
+            )
+            result = read_and_validate_excel(tmp.name)
+        os.unlink(tmp.name)
+
+        self.assertTrue(result.is_valid)
+        self.assertEqual(len(result.rows), 3)
+        self.assertEqual(result.rows[0].category, "INGRESOS")
+        self.assertEqual(result.rows[0].subcategory, "Nacionales")
+
+    def test_missing_columns_returns_error(self):
+        from accounts.excel_utils import read_and_validate_excel
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            _make_test_xlsx(
+                [("Col A", "Col B", "Col C")],
+                tmp.name,
+            )
+            result = read_and_validate_excel(tmp.name)
+        os.unlink(tmp.name)
+
+        self.assertFalse(result.is_valid)
+        self.assertTrue(any("Missing required columns" in e for e in result.errors))
+
+    def test_file_not_found_returns_error(self):
+        from accounts.excel_utils import read_and_validate_excel
+
+        result = read_and_validate_excel("/tmp/nonexistent_file.xlsx")
+        self.assertFalse(result.is_valid)
+        self.assertTrue(any("File not found" in e for e in result.errors))
+
+    def test_unsupported_format_returns_error(self):
+        from accounts.excel_utils import read_and_validate_excel
+
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as tmp:
+            tmp.write(b"a,b,c")
+            tmp_name = tmp.name
+        result = read_and_validate_excel(tmp_name)
+        os.unlink(tmp_name)
+
+        self.assertFalse(result.is_valid)
+        self.assertTrue(any("Unsupported" in e for e in result.errors))
+
+    def test_empty_rows_skipped(self):
+        from accounts.excel_utils import read_and_validate_excel
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            _make_test_xlsx(
+                [
+                    (
+                        "Nombre Categoría",
+                        "Nombre Subcategoría",
+                        "Nombre Cuenta",
+                        "Descripción Cuenta",
+                    ),
+                    ("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+                    (None, None, None, None),  # empty row
+                    ("GASTOS", "Admin", "5105030100", "Gastos"),
+                ],
+                tmp.name,
+            )
+            result = read_and_validate_excel(tmp.name)
+        os.unlink(tmp.name)
+
+        self.assertTrue(result.is_valid)
+        self.assertEqual(len(result.rows), 2)
+
+    def test_partial_row_generates_warning(self):
+        from accounts.excel_utils import read_and_validate_excel
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            _make_test_xlsx(
+                [
+                    (
+                        "Nombre Categoría",
+                        "Nombre Subcategoría",
+                        "Nombre Cuenta",
+                        "Descripción Cuenta",
+                    ),
+                    ("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+                    ("INGRESOS", None, "9999999999", "Missing subcat"),
+                ],
+                tmp.name,
+            )
+            result = read_and_validate_excel(tmp.name)
+        os.unlink(tmp.name)
+
+        self.assertTrue(result.is_valid)
+        self.assertEqual(len(result.rows), 1)
+        self.assertTrue(len(result.warnings) > 0)
+
+    def test_numeric_account_code_normalised(self):
+        from accounts.excel_utils import read_and_validate_excel
+
+        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+            _make_test_xlsx(
+                [
+                    (
+                        "Nombre Categoría",
+                        "Nombre Subcategoría",
+                        "Nombre Cuenta",
+                        "Descripción Cuenta",
+                    ),
+                    ("INGRESOS", "Nacionales", 4120950100, "Ventas"),
+                ],
+                tmp.name,
+            )
+            result = read_and_validate_excel(tmp.name)
+        os.unlink(tmp.name)
+
+        self.assertTrue(result.is_valid)
+        self.assertEqual(result.rows[0].account_code, "4120950100")
+
+    def test_build_puc_schema(self):
+        from accounts.excel_utils import ExcelRow, build_puc_schema
+
+        rows = [
+            ExcelRow("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+            ExcelRow("GASTOS", "Admin", "5105030100", "Gastos"),
+        ]
+        schema = build_puc_schema(rows)
+        self.assertEqual(schema["4120950100"], ("INGRESOS", "Nacionales"))
+        self.assertEqual(schema["5105030100"], ("GASTOS", "Admin"))
+
+    def test_build_category_tree(self):
+        from accounts.excel_utils import ExcelRow, build_category_tree
+
+        rows = [
+            ExcelRow("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+            ExcelRow("INGRESOS", "Exterior", "4120950200", "Export"),
+            ExcelRow("GASTOS", "Admin", "5105030100", "Gastos"),
+        ]
+        tree = build_category_tree(rows)
+        self.assertEqual(len(tree), 2)
+        self.assertEqual(tree["INGRESOS"], {"Nacionales", "Exterior"})
+        self.assertEqual(tree["GASTOS"], {"Admin"})
+
+
+# --------------------------------------------------------------------------
+# load_categories_from_excel command tests
+# --------------------------------------------------------------------------
+
+class LoadCategoriesFromExcelTests(TestCase):
+    """Tests for the load_categories_from_excel management command."""
+
+    def _make_excel(self, rows):
+        """Create a temp .xlsx and return its path."""
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".xlsx", delete=False, dir=tempfile.gettempdir(),
+        )
+        _make_test_xlsx(rows, tmp.name)
+        tmp.close()
+        return tmp.name
+
+    def test_creates_categories_and_subcategories(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        path = self._make_excel([
+            (
+                "Nombre Categoría",
+                "Nombre Subcategoría",
+                "Nombre Cuenta",
+                "Descripción Cuenta",
+            ),
+            ("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+            ("INGRESOS", "Exterior", "4120950200", "Export"),
+            ("GASTOS OP", "Admin", "5105030100", "Gastos admin"),
+        ])
+
+        out = StringIO()
+        try:
+            call_command(
+                "load_categories_from_excel", "1100", path, stdout=out,
+            )
+        finally:
+            os.unlink(path)
+
+        # Categories
+        self.assertTrue(
+            AccountClassification.objects.filter(
+                cat="INGRESOS", sociedad="1100", level=0,
+            ).exists()
+        )
+        self.assertTrue(
+            AccountClassification.objects.filter(
+                cat="GASTOS OP", sociedad="1100", level=0,
+            ).exists()
+        )
+
+        # Subcategories
+        sub_nac = AccountClassification.objects.get(
+            subcat="Nacionales", sociedad="1100", level=1,
+        )
+        self.assertEqual(sub_nac.cat, "INGRESOS")
+        self.assertIsNotNone(sub_nac.parent)
+        self.assertEqual(sub_nac.parent.cat, "INGRESOS")
+
+    def test_validate_only_does_not_create(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        path = self._make_excel([
+            (
+                "Nombre Categoría",
+                "Nombre Subcategoría",
+                "Nombre Cuenta",
+                "Descripción Cuenta",
+            ),
+            ("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+        ])
+
+        out = StringIO()
+        try:
+            call_command(
+                "load_categories_from_excel",
+                "1100",
+                path,
+                "--validate-only",
+                stdout=out,
+            )
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(AccountClassification.objects.count(), 0)
+
+    def test_invalid_excel_raises_command_error(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+
+        path = self._make_excel([("Bad", "Headers", "Only")])
+
+        try:
+            with self.assertRaises(CommandError):
+                call_command(
+                    "load_categories_from_excel",
+                    "1100",
+                    path,
+                    stdout=StringIO(),
+                    stderr=StringIO(),
+                )
+        finally:
+            os.unlink(path)
+
+    def test_idempotent_creation(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        path = self._make_excel([
+            (
+                "Nombre Categoría",
+                "Nombre Subcategoría",
+                "Nombre Cuenta",
+                "Descripción Cuenta",
+            ),
+            ("INGRESOS", "Nacionales", "4120950100", "Ventas"),
+        ])
+
+        try:
+            call_command(
+                "load_categories_from_excel", "1100", path, stdout=StringIO(),
+            )
+            call_command(
+                "load_categories_from_excel", "1100", path, stdout=StringIO(),
+            )
+        finally:
+            os.unlink(path)
+
+        self.assertEqual(
+            AccountClassification.objects.filter(
+                cat="INGRESOS", sociedad="1100", level=0,
+            ).count(),
+            1,
+        )
+        self.assertEqual(
+            AccountClassification.objects.filter(
+                subcat="Nacionales", sociedad="1100", level=1,
+            ).count(),
+            1,
+        )
+
+    def test_real_excel_1100_valid(self):
+        """Smoke test: the real Excel file for sociedad 1100 is valid."""
+        from accounts.excel_utils import read_and_validate_excel
+
+        # accounts/tests.py -> accounts/ -> project root
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        xlsx_path = os.path.join(
+            project_root,
+            "Esquema_Cuentas_PUC_1100_20260212 (ES).xlsx",
+        )
+        if not os.path.exists(xlsx_path):
+            self.skipTest("Real Excel file not available in this environment.")
+        result = read_and_validate_excel(xlsx_path)
+        self.assertTrue(result.is_valid, msg=result.errors)
+        self.assertGreater(len(result.rows), 0)
+
+    def test_real_excel_1000_valid(self):
+        """Smoke test: the real Excel file for sociedad 1000 is valid."""
+        from accounts.excel_utils import read_and_validate_excel
+
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        xlsx_path = os.path.join(
+            project_root,
+            "Esquema_Cuentas_PUC_1000_20260212-.xlsx",
+        )
+        if not os.path.exists(xlsx_path):
+            self.skipTest("Real Excel file not available in this environment.")
+        result = read_and_validate_excel(xlsx_path)
+        self.assertTrue(result.is_valid, msg=result.errors)
+        self.assertGreater(len(result.rows), 0)
