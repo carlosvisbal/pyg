@@ -1,6 +1,8 @@
 from django.core.management.base import BaseCommand
 
 from accounts.models import Account, AccountClassification
+
+MAX_CODE_LENGTH = AccountClassification._meta.get_field("code").max_length
 from accounts.puc_schemas import get_puc_schema
 
 
@@ -103,7 +105,7 @@ class Command(BaseCommand):
             tree.setdefault(cat, set()).add(subcat)
 
         for nombre_cat, subcats in sorted(tree.items()):
-            cat_code = nombre_cat[:50]
+            cat_code = nombre_cat[:MAX_CODE_LENGTH]
             categoria, cat_created = AccountClassification.objects.get_or_create(
                 code=cat_code,
                 sociedad=sociedad,
@@ -118,7 +120,7 @@ class Command(BaseCommand):
                 )
 
             for nombre_subcat in sorted(subcats):
-                sub_code = f"{cat_code}:{nombre_subcat}"[:50]
+                sub_code = f"{cat_code}:{nombre_subcat}"[:MAX_CODE_LENGTH]
                 _subcat, sub_created = AccountClassification.objects.get_or_create(
                     code=sub_code,
                     sociedad=sociedad,
@@ -182,8 +184,7 @@ class Command(BaseCommand):
             " UID=;"
             " PWD="
         )
-        conn = pyodbc.connect(conn_str)
-        try:
+        with pyodbc.connect(conn_str) as conn:
             cursor = conn.cursor()
             query = (
                 "SELECT SKA1.KTOPL AS [PLAN DE CUENTA], "
@@ -200,5 +201,3 @@ class Command(BaseCommand):
             cursor.execute(query, (sociedad,))
             column_names = [desc[0] for desc in cursor.description]
             return [dict(zip(column_names, row)) for row in cursor]
-        finally:
-            conn.close()

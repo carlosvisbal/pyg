@@ -2,14 +2,14 @@ from django.conf import settings
 from django.db import models
 from django.utils import timezone
 
+SOCIEDAD_CHOICES = [
+    ("1000", "Sociedad 1000"),
+    ("1100", "Sociedad 1100"),
+]
+
 
 class AccountClassification(models.Model):
     """Hierarchical classification for P&L accounts (e.g. Revenue > Sales)."""
-
-    SOCIEDAD_CHOICES = [
-        ("1000", "Sociedad 1000"),
-        ("1100", "Sociedad 1100"),
-    ]
 
     name = models.CharField(max_length=255)
     code = models.CharField(max_length=50)
@@ -50,11 +50,6 @@ class AccountClassification(models.Model):
 
 class Account(models.Model):
     """Individual P&L account linked to a classification."""
-
-    SOCIEDAD_CHOICES = [
-        ("1000", "Sociedad 1000"),
-        ("1100", "Sociedad 1100"),
-    ]
 
     code = models.CharField(max_length=50)
     name = models.CharField(max_length=255)

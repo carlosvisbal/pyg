@@ -1513,6 +1513,11 @@ PUC_SCHEMA_1100 = {
 }
 
 
+from accounts.models import SOCIEDAD_CHOICES
+
+_VALID_SOCIEDADES = {code for code, _label in SOCIEDAD_CHOICES}
+
+
 def get_puc_schema(sociedad: str) -> dict[str, tuple[str, str]]:
     """Return the PUC schema for the given company (sociedad)."""
     schemas = {
@@ -1522,6 +1527,6 @@ def get_puc_schema(sociedad: str) -> dict[str, tuple[str, str]]:
     if sociedad not in schemas:
         raise ValueError(
             f"No PUC schema available for sociedad '{sociedad}'. "
-            f"Valid options: {list(schemas.keys())}"
+            f"Valid options: {sorted(_VALID_SOCIEDADES)}"
         )
     return schemas[sociedad]
