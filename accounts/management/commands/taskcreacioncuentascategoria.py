@@ -56,9 +56,9 @@ class Command(BaseCommand):
 
             # Retrieve the subcategory classification
             subcategoria = AccountClassification.objects.filter(
-                name=nombre_subcat,
+                cat=nombre_cat,
+                subcat=nombre_subcat,
                 sociedad=sociedad,
-                parent__name=nombre_cat,
             ).first()
 
             if subcategoria is None:
@@ -112,6 +112,7 @@ class Command(BaseCommand):
                 defaults={
                     "name": nombre_cat,
                     "level": 0,
+                    "cat": nombre_cat,
                 },
             )
             if cat_created:
@@ -128,6 +129,8 @@ class Command(BaseCommand):
                         "name": nombre_subcat,
                         "parent": categoria,
                         "level": 1,
+                        "cat": nombre_cat,
+                        "subcat": nombre_subcat,
                     },
                 )
                 if sub_created:

@@ -67,9 +67,9 @@ class AdjustmentHistoryInline(admin.TabularInline):
 
 @admin.register(AccountClassification)
 class AccountClassificationAdmin(admin.ModelAdmin):
-    list_display = ("code", "name", "parent", "level", "sign", "is_active")
+    list_display = ("code", "name", "cat", "subcat", "parent", "level", "sign", "is_active")
     list_filter = ("is_active", "level")
-    search_fields = ("code", "name")
+    search_fields = ("code", "name", "cat", "subcat")
     inlines = [AccountInline]
 
 
